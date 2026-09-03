@@ -190,6 +190,21 @@ def init_db():
                 )
             """)
 
+            # Debts / Lend tracker
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS debts(
+                    id SERIAL PRIMARY KEY,
+                    person TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    direction TEXT NOT NULL CHECK (direction IN ('lent', 'borrowed')),
+                    reason TEXT DEFAULT '',
+                    date TEXT NOT NULL,
+                    settled BOOLEAN DEFAULT FALSE,
+                    settled_date TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             print("Database initialized successfully (all tables ready)")
             conn.commit()
     except Exception as e:
@@ -1912,11 +1927,165 @@ async def tracker_info() -> dict:
             "Budget Tracking with Global Limits (Daily/Weekly/Monthly) & Multi-tier Alerts",
             "Payment Method Classification (Cash, UPI, Cards, etc.)",
             "Tagging System (many-to-many labels)",
+            "Debt & Lend Tracking (who owes whom, settle up)",
             "Bulk Import via CSV",
             "Rich Interactive Charts (Pie, Bar, Trend, Income vs Expense)"
         ],
-        "usage_tip": "Ask me to 'chart income vs expense for 6 months' or 'import these expenses from csv'."
+        "usage_tip": "Ask me to 'chart income vs expense for 6 months' or 'I paid lunch for Ravi, he owes me 300'."
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DEBT & LEND TRACKING
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def add_debt(
+    person: str, amount: float, direction: str,
+    reason: str = "", date: str = None
+) -> dict:
+    """Record a debt or lending. Use when you pay for someone or borrow from someone.
+
+    Args:
+        person: Name of the person (e.g. 'Ravi', 'Sneha')
+        amount: Amount in rupees (must be positive)
+        direction: 'lent' if you paid for them (they owe you), 'borrowed' if they paid for you (you owe them)
+        reason: Why (e.g. 'Lunch at office', 'Movie tickets')
+        date: Date in YYYY-MM-DD format (defaults to today)
+    """
+    try:
+        _validate_amount(amount)
+        target_date = date if date else datetime.now().strftime("%Y-%m-%d")
+        _validate_date(target_date)
+        direction = direction.strip().lower()
+        if direction not in ('lent', 'borrowed'):
+            return {"status": "error", "message": "Direction must be 'lent' or 'borrowed'."}
+        if not person.strip():
+            return {"status": "error", "message": "Person name cannot be empty."}
+
+        async with pool.connection() as c:
+            cur = await c.execute(
+                "INSERT INTO debts(person, amount, direction, reason, date) VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                (person.strip(), amount, direction, reason.strip(), target_date)
+            )
+            row = await cur.fetchone()
+            debt_id = row[0] if row else None
+            await c.commit()
+
+            if direction == 'lent':
+                msg = f"Recorded: {person} owes you \u20b9{amount:.2f} for '{reason}'"
+            else:
+                msg = f"Recorded: You owe {person} \u20b9{amount:.2f} for '{reason}'"
+
+            return {"status": "success", "id": debt_id, "message": msg}
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+    except Exception as e:
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+
+@mcp.tool()
+async def list_debts(person: str = None, show_settled: bool = False) -> list | dict:
+    """List all debts/lending records. Filter by person or show only unsettled.
+
+    Args:
+        person: Filter by person name (optional)
+        show_settled: If True, include settled debts too (default: only unsettled)
+    """
+    try:
+        conditions = []
+        params = []
+        if not show_settled:
+            conditions.append("settled = FALSE")
+        if person:
+            conditions.append("LOWER(person) = LOWER(%s)")
+            params.append(person.strip())
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        async with pool.connection() as c:
+            cur = await c.execute(
+                f"SELECT id, person, amount, direction, reason, date, settled, settled_date FROM debts {where} ORDER BY date DESC",
+                params
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
+    except Exception as e:
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+
+@mcp.tool()
+async def settle_debt(id: int) -> dict:
+    """Mark a debt as settled/paid back.
+
+    Args:
+        id: The debt ID to settle
+    """
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        async with pool.connection() as c:
+            cur = await c.execute(
+                "UPDATE debts SET settled = TRUE, settled_date = %s WHERE id = %s",
+                (today, id)
+            )
+            await c.commit()
+            if cur.rowcount == 0:
+                return {"status": "error", "message": f"Debt with id {id} not found."}
+            return {"status": "success", "message": f"Debt {id} marked as settled."}
+    except Exception as e:
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+
+@mcp.tool()
+async def delete_debt(id: int) -> dict:
+    """Delete a debt record entirely.
+
+    Args:
+        id: The debt ID to delete
+    """
+    try:
+        async with pool.connection() as c:
+            cur = await c.execute("DELETE FROM debts WHERE id = %s", (id,))
+            await c.commit()
+            if cur.rowcount == 0:
+                return {"status": "error", "message": f"Debt with id {id} not found."}
+            return {"status": "success", "message": f"Debt {id} deleted."}
+    except Exception as e:
+        return {"status": "error", "message": f"Error: {str(e)}"}
+
+
+@mcp.tool()
+async def debt_summary() -> dict:
+    """Get a summary of all outstanding debts — who owes you and who you owe."""
+    try:
+        async with pool.connection() as c:
+            # People who owe you
+            cur = await c.execute(
+                """SELECT person, SUM(amount) as total FROM debts
+                   WHERE direction = 'lent' AND settled = FALSE
+                   GROUP BY person ORDER BY total DESC"""
+            )
+            they_owe_you = [{"person": r[0], "amount": round(r[1], 2)} for r in await cur.fetchall()]
+
+            # People you owe
+            cur = await c.execute(
+                """SELECT person, SUM(amount) as total FROM debts
+                   WHERE direction = 'borrowed' AND settled = FALSE
+                   GROUP BY person ORDER BY total DESC"""
+            )
+            you_owe_them = [{"person": r[0], "amount": round(r[1], 2)} for r in await cur.fetchall()]
+
+            total_owed_to_you = sum(d["amount"] for d in they_owe_you)
+            total_you_owe = sum(d["amount"] for d in you_owe_them)
+
+            return {
+                "they_owe_you": they_owe_you,
+                "total_owed_to_you": round(total_owed_to_you, 2),
+                "you_owe_them": you_owe_them,
+                "total_you_owe": round(total_you_owe, 2),
+                "net_position": round(total_owed_to_you - total_you_owe, 2)
+            }
+    except Exception as e:
+        return {"status": "error", "message": f"Error: {str(e)}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════

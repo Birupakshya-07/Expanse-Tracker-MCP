@@ -21,22 +21,20 @@ CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 mcp = FastMCP("ExpenseTracker")
 
-# Connection pool (only created if DATABASE_URL is available)
-pool = None
-if DATABASE_URL:
-    pool = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=10, open=False)
+# Connection pool (lazy-initialized on first use)
+_pool = None
+_db_initialized = False
 
-@mcp.lifecycle()
-async def on_startup():
-    if pool:
-        await pool.open()
-    # Initialize tables on first startup
-    init_db()
-
-@mcp.lifecycle()
-async def on_shutdown():
-    if pool:
-        await pool.close()
+async def get_pool():
+    """Get the connection pool, opening it lazily on first call."""
+    global _pool, _db_initialized
+    if _pool is None and DATABASE_URL:
+        _pool = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=10)
+        await _pool.open()
+        if not _db_initialized:
+            init_db()
+            _db_initialized = True
+    return _pool
 
 
 
@@ -237,6 +235,7 @@ async def add_expense(
         if not category.strip():
             return {"status": "error", "message": "Category cannot be empty."}
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 "INSERT INTO expenses(date, amount, category, subcategory, note, payment_method) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
@@ -278,6 +277,7 @@ async def get_expense(id: int) -> dict:
         id: The expense ID to look up
     """
     try:
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 "SELECT id, date, amount, category, subcategory, note, payment_method FROM expenses WHERE id = %s",
@@ -339,6 +339,7 @@ async def update_expense(
             return {"status": "error", "message": "No fields to update."}
 
         params.append(id)
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 f"UPDATE expenses SET {', '.join(updates)} WHERE id = %s", params
@@ -361,6 +362,7 @@ async def delete_expense(id: int) -> dict:
         id: The expense ID to delete
     """
     try:
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute("DELETE FROM expenses WHERE id = %s", (id,))
             await c.commit()
@@ -382,6 +384,7 @@ async def list_expenses(start_date: str, end_date: str) -> list | dict:
     try:
         _validate_date(start_date)
         _validate_date(end_date)
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 """SELECT id, date, amount, category, subcategory, note, payment_method
@@ -411,6 +414,7 @@ async def summarize(
     try:
         _validate_date(start_date)
         _validate_date(end_date)
+        pool = await get_pool()
         async with pool.connection() as c:
             query = """
                 SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
@@ -442,6 +446,7 @@ async def spending_by_payment_method(month: str) -> dict:
         _validate_month(month)
         start, end = _month_date_range(month)
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 """SELECT payment_method, SUM(amount) as total, COUNT(*) as count
@@ -531,6 +536,7 @@ async def search_expenses(
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(min(limit, 200))
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 f"""SELECT id, date, amount, category, subcategory, note, payment_method
@@ -564,6 +570,7 @@ async def tag_expense(expense_id: int, tag: str) -> dict:
             return {"status": "error", "message": "Tag cannot be empty."}
 
         import sqlite3
+        pool = await get_pool()
         async with pool.connection() as c:
             # Check if expense exists
             cur = await c.execute("SELECT id FROM expenses WHERE id = %s", (expense_id,))
@@ -593,6 +600,7 @@ async def untag_expense(expense_id: int, tag: str) -> dict:
     """
     try:
         tag = tag.strip().lower()
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 "DELETE FROM expense_tags WHERE expense_id = %s AND tag = %s",
@@ -610,6 +618,7 @@ async def untag_expense(expense_id: int, tag: str) -> dict:
 async def list_tags() -> dict:
     """List all unique tags and how many times they are used."""
     try:
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 "SELECT tag, COUNT(expense_id) as count FROM expense_tags GROUP BY tag ORDER BY count DESC, tag ASC"
@@ -629,6 +638,7 @@ async def search_by_tag(tag: str) -> list | dict:
     """
     try:
         tag = tag.strip().lower()
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 """SELECT e.id, e.date, e.amount, e.category, e.subcategory, e.note, e.payment_method
@@ -687,6 +697,7 @@ async def set_budget(category: str, monthly_limit: float) -> dict:
         _validate_amount(monthly_limit)
         if not category.strip():
             return {"status": "error", "message": "Category cannot be empty."}
+        pool = await get_pool()
         async with pool.connection() as c:
             await c.execute(
                 """INSERT INTO budgets(category, monthly_limit) VALUES (%s, %s)
@@ -705,6 +716,7 @@ async def set_budget(category: str, monthly_limit: float) -> dict:
 async def get_budgets() -> list | dict:
     """List all category budgets."""
     try:
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 "SELECT category, monthly_limit FROM budgets ORDER BY category"
@@ -724,6 +736,7 @@ async def check_budget(month: str) -> list | dict:
     try:
         _validate_month(month)
         start, end = _month_date_range(month)
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute("""
                 SELECT b.category, b.monthly_limit,
@@ -828,6 +841,7 @@ async def set_global_limits(daily: float = None, weekly: float = None, monthly: 
         if not updates:
             return {"status": "error", "message": "No limits provided to update."}
 
+        pool = await get_pool()
         async with pool.connection() as c:
             # ensure row exists
             await c.execute("INSERT INTO global_limits(id) VALUES (1) ON CONFLICT (id) DO NOTHING")
@@ -851,6 +865,7 @@ async def check_global_spending(date: str = None) -> dict:
         target_date = date if date else datetime.now().strftime("%Y-%m-%d")
         _validate_date(target_date)
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute("SELECT daily_limit, weekly_limit, monthly_limit FROM global_limits WHERE id = 1")
             row = await cur.fetchone()
@@ -907,6 +922,7 @@ async def delete_budget(category: str) -> dict:
         category: The category whose budget to remove
     """
     try:
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute("DELETE FROM budgets WHERE category = %s", (category,))
             await c.commit()
@@ -944,6 +960,7 @@ async def monthly_comparison(month1: str, month2: str) -> dict:
             )
             return {r[0]: r[1] for r in await cur.fetchall()}
 
+        pool = await get_pool()
         async with pool.connection() as c:
             s1 = await _month_summary(c, month1)
             s2 = await _month_summary(c, month2)
@@ -992,6 +1009,7 @@ async def dashboard(month: str) -> dict:
         year, mon = int(month[:4]), int(month[5:7])
         days_in_month = monthrange(year, mon)[1]
 
+        pool = await get_pool()
         async with pool.connection() as c:
             # Total & count
             cur = await c.execute(
@@ -1074,6 +1092,7 @@ async def category_trend(category: str, months: int = 6) -> list | dict:
         today = datetime.now()
         results = []
 
+        pool = await get_pool()
         async with pool.connection() as c:
             for i in range(months - 1, -1, -1):
                 # Calculate month offset
@@ -1116,6 +1135,7 @@ async def export_csv(start_date: str, end_date: str) -> dict:
         _validate_date(start_date)
         _validate_date(end_date)
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 """SELECT id, date, amount, category, subcategory, note, payment_method
@@ -1197,6 +1217,7 @@ async def add_income(
         if not source.strip():
             return {"status": "error", "message": "Source cannot be empty."}
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 "INSERT INTO income(date, amount, source, note) VALUES (%s,%s,%s,%s) RETURNING id",
@@ -1226,6 +1247,7 @@ async def list_income(start_date: str, end_date: str) -> list | dict:
     try:
         _validate_date(start_date)
         _validate_date(end_date)
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 """SELECT id, date, amount, source, note
@@ -1252,6 +1274,7 @@ async def savings_summary(month: str) -> dict:
         _validate_month(month)
         start, end = _month_date_range(month)
 
+        pool = await get_pool()
         async with pool.connection() as c:
             # Total income
             cur = await c.execute(
@@ -1331,6 +1354,7 @@ async def update_income(
             return {"status": "error", "message": "No fields to update."}
 
         params.append(id)
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 f"UPDATE income SET {', '.join(updates)} WHERE id = %s", params
@@ -1353,6 +1377,7 @@ async def delete_income(id: int) -> dict:
         id: The income ID to delete
     """
     try:
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute("DELETE FROM income WHERE id = %s", (id,))
             await c.commit()
@@ -1391,6 +1416,7 @@ async def import_expenses_csv(csv_data: str, has_header: bool = True) -> dict:
         if has_header and rows:
             rows = rows[1:]
             
+        pool = await get_pool()
         async with pool.connection() as c:
             for i, row in enumerate(rows):
                 line_num = i + (2 if has_header else 1)
@@ -1507,6 +1533,7 @@ async def chart_spending_pie(month: str) -> ImageContent:
         _validate_month(month)
         start, end = _month_date_range(month)
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 """SELECT category, SUM(amount) as total
@@ -1563,6 +1590,7 @@ async def chart_monthly_trend(months: int = 6) -> ImageContent:
         labels = []
         totals = []
 
+        pool = await get_pool()
         async with pool.connection() as c:
             for i in range(months - 1, -1, -1):
                 target_month = today.month - i
@@ -1617,6 +1645,7 @@ async def chart_category_bars(month: str) -> ImageContent:
         _validate_month(month)
         start, end = _month_date_range(month)
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 """SELECT category, SUM(amount) as total
@@ -1677,6 +1706,7 @@ async def chart_comparison_bars(month1: str, month2: str) -> ImageContent:
             )
             return {r[0]: r[1] for r in await cur.fetchall()}
 
+        pool = await get_pool()
         async with pool.connection() as c:
             d1 = await _get_cat_totals(c, month1)
             d2 = await _get_cat_totals(c, month2)
@@ -1740,6 +1770,7 @@ async def chart_daily_histogram(month: str) -> ImageContent:
         year, mon = int(month[:4]), int(month[5:7])
         days_in_month = monthrange(year, mon)[1]
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 """SELECT date, SUM(amount) as total
@@ -1799,6 +1830,7 @@ async def chart_category_stacked(months: int = 6) -> ImageContent:
         month_labels = []
         all_data = {}  # {category: [amounts per month]}
 
+        pool = await get_pool()
         async with pool.connection() as c:
             for i in range(months - 1, -1, -1):
                 target_month = today.month - i
@@ -1870,6 +1902,7 @@ async def chart_income_vs_expense(months: int = 6) -> ImageContent:
         income_vals = []
         expense_vals = []
 
+        pool = await get_pool()
         async with pool.connection() as c:
             for i in range(months - 1, -1, -1):
                 target_month = today.month - i
@@ -1963,6 +1996,7 @@ async def add_debt(
         if not person.strip():
             return {"status": "error", "message": "Person name cannot be empty."}
 
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 "INSERT INTO debts(person, amount, direction, reason, date) VALUES (%s,%s,%s,%s,%s) RETURNING id",
@@ -2002,6 +2036,7 @@ async def list_debts(person: str = None, show_settled: bool = False) -> list | d
             params.append(person.strip())
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 f"SELECT id, person, amount, direction, reason, date, settled, settled_date FROM debts {where} ORDER BY date DESC",
@@ -2022,6 +2057,7 @@ async def settle_debt(id: int) -> dict:
     """
     try:
         today = datetime.now().strftime("%Y-%m-%d")
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute(
                 "UPDATE debts SET settled = TRUE, settled_date = %s WHERE id = %s",
@@ -2043,6 +2079,7 @@ async def delete_debt(id: int) -> dict:
         id: The debt ID to delete
     """
     try:
+        pool = await get_pool()
         async with pool.connection() as c:
             cur = await c.execute("DELETE FROM debts WHERE id = %s", (id,))
             await c.commit()
@@ -2057,6 +2094,7 @@ async def delete_debt(id: int) -> dict:
 async def debt_summary() -> dict:
     """Get a summary of all outstanding debts — who owes you and who you owe."""
     try:
+        pool = await get_pool()
         async with pool.connection() as c:
             # People who owe you
             cur = await c.execute(

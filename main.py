@@ -17,27 +17,27 @@ from calendar import monthrange
 
 # ─── Database Configuration ───────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL")
+CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
+mcp = FastMCP("ExpenseTracker")
+
+# Connection pool (only created if DATABASE_URL is available)
+pool = None
 if DATABASE_URL:
     pool = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=10, open=False)
-else:
-    pool = None
-    print("WARNING: DATABASE_URL environment variable is not set!")
 
 @mcp.lifecycle()
 async def on_startup():
     if pool:
         await pool.open()
+    # Initialize tables on first startup
+    init_db()
 
 @mcp.lifecycle()
 async def on_shutdown():
     if pool:
         await pool.close()
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
-print(f"Database path: {DB_PATH}")
-
-mcp = FastMCP("ExpenseTracker")
 
 
 # ─── Validation Helpers ───────────────────────────────────────────────
@@ -191,13 +191,10 @@ def init_db():
             """)
 
             print("Database initialized successfully (all tables ready)")
+            conn.commit()
     except Exception as e:
         print(f"Database initialization error: {e}")
-        raise
 
-
-# Initialize database synchronously at module load
-init_db()
 
 
 # ═══════════════════════════════════════════════════════════════════════

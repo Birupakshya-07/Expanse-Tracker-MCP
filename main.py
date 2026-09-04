@@ -1956,6 +1956,76 @@ async def chart_income_vs_expense(months: int = 6) -> ImageContent:
 #  INFO TOOL
 # ═══════════════════════════════════════════════════════════════════════
 
+
+@mcp.tool()
+async def db_debug() -> dict:
+    """Run network diagnostics to figure out why the database connection is failing."""
+    import socket
+    import asyncio
+    import traceback
+    
+    results = {
+        "database_url_configured": bool(DATABASE_URL),
+        "host": "",
+        "dns_resolution": None,
+        "tcp_ping_5432": None,
+        "tcp_ping_6543": None,
+        "direct_connection_test": None
+    }
+    
+    if not DATABASE_URL:
+        return results
+        
+    try:
+        # Extract host
+        host_match = re.search(r"@([^:/]+)", DATABASE_URL)
+        if host_match:
+            host = host_match.group(1)
+            results["host"] = host
+            
+            # DNS resolution
+            try:
+                addr_info = socket.getaddrinfo(host, 5432)
+                results["dns_resolution"] = [f"{ai[0].name}: {ai[4][0]}" for ai in addr_info]
+            except Exception as e:
+                results["dns_resolution"] = f"Failed: {str(e)}"
+                
+            # TCP Ping 5432
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, 5432), timeout=3.0)
+                writer.close()
+                await writer.wait_closed()
+                results["tcp_ping_5432"] = "Success"
+            except Exception as e:
+                results["tcp_ping_5432"] = f"Failed: {str(e)}"
+                
+            # TCP Ping 6543
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, 6543), timeout=3.0)
+                writer.close()
+                await writer.wait_closed()
+                results["tcp_ping_6543"] = "Success"
+            except Exception as e:
+                results["tcp_ping_6543"] = f"Failed: {str(e)}"
+                
+    except Exception as e:
+        results["error"] = str(e)
+        
+    # Test direct psycopg connection
+    try:
+        conn_str = DATABASE_URL
+        if "?" not in conn_str:
+            conn_str += "?sslmode=require"
+        elif "sslmode=" not in conn_str:
+            conn_str += "&sslmode=require"
+            
+        async with await asyncio.wait_for(psycopg.AsyncConnection.connect(conn_str), timeout=5.0) as conn:
+            results["direct_connection_test"] = "Success"
+    except Exception as e:
+        results["direct_connection_test"] = f"Failed: {type(e).__name__} - {str(e)}"
+        
+    return results
+
 @mcp.tool()
 async def tracker_info() -> dict:
     """Get information about available tools and capabilities in the expense tracker."""

@@ -16,7 +16,11 @@ from datetime import datetime, timedelta
 from calendar import monthrange
 
 # ─── Database Configuration ───────────────────────────────────────────
-DATABASE_URL = os.environ.get("DATABASE_URL")
+raw_db_url = os.environ.get("DATABASE_URL", "")
+# Sanitize in case they accidentally pasted 'DATABASE_URL="postgres://..."'
+raw_db_url = raw_db_url.replace("DATABASE_URL=", "").strip(" \"'")
+DATABASE_URL = raw_db_url if raw_db_url else None
+
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 mcp = FastMCP("ExpenseTracker")

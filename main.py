@@ -29,10 +29,17 @@ async def get_pool():
     """Get the connection pool, opening it lazily on first call."""
     global _pool, _db_initialized
     if _pool is None and DATABASE_URL:
-        _pool = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=10)
+        # Add sslmode=require if missing, helps with cloud connections
+        conn_str = DATABASE_URL
+        if "?" not in conn_str:
+            conn_str += "?sslmode=require"
+        elif "sslmode=" not in conn_str:
+            conn_str += "&sslmode=require"
+            
+        _pool = AsyncConnectionPool(conninfo=conn_str, min_size=1, max_size=5, timeout=15.0)
         await _pool.open()
         if not _db_initialized:
-            init_db()
+            await init_db()
             _db_initialized = True
     return _pool
 
@@ -116,16 +123,14 @@ def _save_categories(categories: list[str]) -> None:
 
 # ─── Database Initialization ─────────────────────────────────────────
 
-def init_db():
-    """Initialize all database tables synchronously at startup."""
-    if not DATABASE_URL:
+async def init_db():
+    """Initialize all database tables asynchronously at startup."""
+    if not _pool:
         return
     try:
-        import psycopg
-        with psycopg.connect(DATABASE_URL) as conn:
-            c = conn.cursor()
+        async with _pool.connection() as conn:
             # Expenses table
-            c.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS expenses(
                     id SERIAL PRIMARY KEY,
                     date TEXT NOT NULL,
@@ -140,12 +145,14 @@ def init_db():
 
             # Add payment_method column if missing (for existing databases)
             try:
-                c.execute("SELECT payment_method FROM expenses LIMIT 1")
+                await conn.execute("SELECT payment_method FROM expenses LIMIT 1")
             except psycopg.errors.UndefinedColumn:
-                c.execute("ALTER TABLE expenses ADD COLUMN payment_method TEXT DEFAULT 'Cash'")
+                # Need to rollback the failed transaction block before continuing
+                await conn.rollback()
+                await conn.execute("ALTER TABLE expenses ADD COLUMN payment_method TEXT DEFAULT 'Cash'")
 
             # Budgets table
-            c.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS budgets(
                     id SERIAL PRIMARY KEY,
                     category TEXT NOT NULL UNIQUE,
@@ -155,7 +162,7 @@ def init_db():
             """)
 
             # Income table
-            c.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS income(
                     id SERIAL PRIMARY KEY,
                     date TEXT NOT NULL,
@@ -167,7 +174,7 @@ def init_db():
             """)
 
             # Expense tags table (many-to-many)
-            c.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS expense_tags(
                     expense_id INTEGER NOT NULL,
                     tag TEXT NOT NULL,
@@ -178,7 +185,7 @@ def init_db():
             """)
 
             # Global spending limits
-            c.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS global_limits(
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     daily_limit REAL,
@@ -189,7 +196,7 @@ def init_db():
             """)
 
             # Debts / Lend tracker
-            c.execute("""
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS debts(
                     id SERIAL PRIMARY KEY,
                     person TEXT NOT NULL,
@@ -204,7 +211,7 @@ def init_db():
             """)
 
             print("Database initialized successfully (all tables ready)")
-            conn.commit()
+            await conn.commit()
     except Exception as e:
         print(f"Database initialization error: {e}")
 
